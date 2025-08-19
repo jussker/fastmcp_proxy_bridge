@@ -1,6 +1,6 @@
 # fastmcp-proxy-bridge
 
-基于 [fastmcp](https://github.com/jlowin/fastmcp) 的 **SSE → STDIO 透明代理**。让只支持本地 STDIO MCP 的客户端（Claude Code / Cursor / VS Code MCP 插件等）可以配置 HTTP_PROXY 后，访问远程 SSE + /mcp 服务。
+基于 [fastmcp](https://github.com/jlowin/fastmcp) 的 **SSE → STDIO 透明代理**。让只支持本地 STDIO MCP 的客户端（Claude Code / Cursor / VS Code MCP 插件等）可以配置 `HTTP_PROXY` 后，访问远程 SSE + /mcp 服务。
 
 ## 特性
 - 0 自行协议实现：直接复用 fastmcp `SSETransport` + `FastMCP.as_proxy()`。
@@ -11,7 +11,13 @@
 
 ## 安装（本地开发）
 ```bash
-uv pip install -e fastmcp_proxy_bridge
+uv pip install git+https://github.com/jussker/fastmcp_proxy_bridge.git
+```
+
+或者
+```bash
+git clone https://github.com/jussker/fastmcp_proxy_bridge.git
+uv pip install -e ./fastmcp_proxy_bridge
 ```
 
 ## 运行示例
@@ -42,5 +48,18 @@ uv pip install -e fastmcp_proxy_bridge
 - 若传 `--socks` 且未设置 `ALL_PROXY`，则写入 `ALL_PROXY`。
 - httpx（fastmcp 底层）默认 `trust_env=True` 自动读取这些变量。
 
+## CLI 启动
+
+安装后可直接：
+```bash
+fastmcp-proxy-bridge --sse https://example.com/sse \
+  --header-template '{"Authorization":"Bearer ${TOKEN}"}'
+```
+
+或使用 `uv run`：
+```bash
+uv run fastmcp-proxy-bridge --sse https://example.com/sse
+```
+
 ## License
-MIT
+MIT License

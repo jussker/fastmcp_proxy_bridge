@@ -8,8 +8,8 @@ version = "0.2.0"
 description = "Transparent SSE -> STDIO proxy MCP server built on fastmcp"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "Apache-2.0"}
-authors = [{name = "Your Name"}]
+license = {text = "MIT"}
+authors = [{name = "jussker"}]
 dependencies = [
 	"fastmcp>=0.2.0", # adjust if needed
 ]
