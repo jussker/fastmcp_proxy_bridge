@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 from fastmcp import FastMCP
+from fastmcp import settings as fastmcp_settings
 from fastmcp.client.client import Client
 from fastmcp.client.transports import SSETransport
 
@@ -59,6 +60,8 @@ class Options:
     socks: Optional[str] = None
     name: str = "Proxy Bridge"
     instructions: Optional[str] = None
+    log_level: Optional[str] = None
+    show_banner: bool = True
 
 
 # ---------------- Header Helpers ----------------
@@ -168,6 +171,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--socks", dest="socks", help="SOCKS5 代理，如 socks5://127.0.0.1:1080"
     )
+    p.add_argument(
+        "--log-level",
+        dest="log_level",
+        help="日志级别 (DEBUG, INFO, WARNING, ERROR, CRITICAL)，或使用环境变量 FASTMCP_LOG_LEVEL",
+    )
+    p.add_argument(
+        "--no-banner",
+        dest="show_banner",
+        action="store_false",
+        help="禁用启动时的 banner 输出",
+    )
     p.add_argument("-h", "--help", action="help")
     return p
 
@@ -184,13 +198,21 @@ def main():  # pragma: no cover
         socks=args.socks,
         name=args.name or "Proxy Bridge",
         instructions=args.instructions,
+        log_level=args.log_level,
+        show_banner=args.show_banner,
     )
     print(
         f"[bridge] start v{VERSION} name={opts.name} sse={opts.sse or os.getenv('MCP_REMOTE_SSE')}",
         file=sys.stderr,
     )
+    # 设置日志级别：优先 CLI -> 环境变量 FASTMCP_LOG_LEVEL（由 pydantic Settings 处理）
+    if opts.log_level:
+        try:
+            fastmcp_settings.log_level = opts.log_level.upper()
+        except Exception as e:  # noqa: BLE001
+            print(f"[bridge] 无效的 log_level '{opts.log_level}': {e}", file=sys.stderr)
     proxy = build_proxy(opts)
-    proxy.run(transport="stdio")
+    proxy.run(transport="stdio", show_banner=opts.show_banner)
 
 
 if __name__ == "__main__":  # pragma: no cover
