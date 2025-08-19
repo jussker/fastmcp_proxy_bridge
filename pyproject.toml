@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastmcp-proxy-bridge"
+version = "0.2.0"
+description = "Transparent SSE -> STDIO proxy MCP server built on fastmcp"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Your Name"}]
+dependencies = [
+	"fastmcp>=0.2.0", # adjust if needed
+]
+keywords = ["mcp", "fastmcp", "proxy", "sse", "stdio"]
+classifiers = [
+	"Programming Language :: Python :: 3",
+	"License :: OSI Approved :: Apache Software License",
+	"Intended Audience :: Developers",
+]
+
+[project.scripts]
+fastmcp-proxy-bridge = "fastmcp_proxy_bridge.bridge:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
