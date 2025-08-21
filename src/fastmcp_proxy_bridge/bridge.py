@@ -38,13 +38,17 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+import anyio
+import httpx
 from fastmcp import FastMCP
 from fastmcp import settings as fastmcp_settings
 from fastmcp.client.client import Client
 from fastmcp.client.transports import SSETransport
+from mcp.shared._httpx_utils import create_mcp_http_client
 
 VERSION = "0.2.0"
 
@@ -62,6 +66,12 @@ class Options:
     instructions: Optional[str] = None
     log_level: Optional[str] = None
     show_banner: bool = True
+    # timeouts / retries
+    connect_timeout: Optional[float] = None  # TCP/TLS 建连 + 首字节
+    request_timeout: Optional[float] = None  # MCP 请求整体（Client(timeout=...))
+    sse_read_timeout: Optional[float] = None  # SSETransport 内部 sse_read_timeout
+    retries: int = 1
+    retry_backoff: float = 2.0  # 指数退避基数（秒）
 
 
 # ---------------- Header Helpers ----------------
@@ -112,6 +122,20 @@ def merge_headers(tmpl: Dict[str, str], extra_pairs: list[str]) -> Dict[str, str
 # ---------------- Core Build ----------------
 
 
+async def _probe_client(client: Client) -> None:
+    """进行一次轻量握手 + list_tools 以验证远程可达。
+
+    失败抛出原始异常供上层重试。
+    """
+    async with client:
+        # list_tools 触发初始化握手；若服务器空列表也算成功
+        try:
+            await client.list_tools()
+        except Exception:
+            # 仍算握手成功（工具列出失败并不一定阻塞调用），但保留继续向外抛出更严重错误
+            raise
+
+
 def build_proxy(opts: Options) -> FastMCP:
     sse_url = opts.sse or os.getenv("MCP_REMOTE_SSE")
     if not sse_url:
@@ -129,8 +153,74 @@ def build_proxy(opts: Options) -> FastMCP:
     if opts.socks and not os.getenv("ALL_PROXY"):
         os.environ["ALL_PROXY"] = opts.socks
 
-    transport = SSETransport(url=sse_url, headers=headers)
-    client = Client(transport)
+    # 定制 httpx client factory 以支持 connect_timeout / request_timeout
+    httpx_client_factory = None
+    if opts.connect_timeout or opts.request_timeout:
+
+        def factory(headers: dict[str, str] | None = None, timeout=None, auth=None):  # type: ignore[override]
+            # 基于用户参数构造 Timeout；若仅设置 connect_timeout 则给一个合理 total
+            total = opts.request_timeout or 30.0
+            connect = opts.connect_timeout
+            # read 阶段若用户提供 request_timeout 就同时设 read；否则交由 httpx 默认
+            httpx_timeout = httpx.Timeout(
+                total, connect=connect, read=opts.request_timeout
+            )
+            return create_mcp_http_client(
+                headers=headers, timeout=httpx_timeout, auth=auth
+            )
+
+        httpx_client_factory = factory
+
+    def make_transport() -> SSETransport:
+        return SSETransport(
+            url=sse_url,
+            headers=headers,
+            sse_read_timeout=opts.sse_read_timeout,
+            httpx_client_factory=httpx_client_factory,
+        )
+
+    attempt = 0
+    last_err: Exception | None = None
+    while attempt < max(1, opts.retries):
+        attempt += 1
+        transport = make_transport()
+        client = Client(transport, timeout=opts.request_timeout)
+        try:
+            # 进行一次探测（同步环境下用 anyio.run）
+            anyio.run(_probe_client, client)
+            if attempt > 1:
+                print(
+                    f"[bridge] probe success after {attempt} attempts", file=sys.stderr
+                )
+            break
+        except (
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.RemoteProtocolError,
+        ) as e:  # noqa: PERF203
+            last_err = e
+            if attempt >= max(1, opts.retries):
+                print(
+                    f"[bridge] probe failed (attempt {attempt}): {e}", file=sys.stderr
+                )
+                raise SystemExit(f"无法建立 SSE 连接: {e}")
+            backoff = opts.retry_backoff * (2 ** (attempt - 1))
+            print(
+                f"[bridge] probe failed (attempt {attempt}/{opts.retries}): {e}; retry in {backoff:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
+            continue
+        except Exception as e:  # 其它异常直接退出
+            print(f"[bridge] unexpected probe error: {e}", file=sys.stderr)
+            raise
+
+    else:
+        # 理论上不会到这里
+        if last_err:
+            raise SystemExit(f"无法建立 SSE 连接: {last_err}")
+
+    # 探测完成后重用最后构造的 client（探测时上下文已关闭，后续会重新建立 session）
     proxy = FastMCP.as_proxy(
         client,
         name=opts.name,
@@ -182,6 +272,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="禁用启动时的 banner 输出",
     )
+    p.add_argument(
+        "--connect-timeout",
+        type=float,
+        dest="connect_timeout",
+        help="SSE 连接阶段（TCP/TLS 首包）超时秒数；默认使用 httpx 默认值 (≈30s)",
+    )
+    p.add_argument(
+        "--request-timeout",
+        type=float,
+        dest="request_timeout",
+        help="单个 MCP 请求总超时秒数（Client timeout）",
+    )
+    p.add_argument(
+        "--sse-read-timeout",
+        type=float,
+        dest="sse_read_timeout",
+        help="SSE 空闲读取超时（无事件间隔），秒；默认使用库内默认值",
+    )
+    p.add_argument(
+        "--retries",
+        type=int,
+        dest="retries",
+        default=1,
+        help="初始探测重试次数（含首次）。默认 1 不重试",
+    )
+    p.add_argument(
+        "--retry-backoff",
+        type=float,
+        dest="retry_backoff",
+        default=2.0,
+        help="重试指数退避基数秒 (实际间隔 = base * 2^(attempt-1))",
+    )
     p.add_argument("-h", "--help", action="help")
     return p
 
@@ -200,6 +322,11 @@ def main():  # pragma: no cover
         instructions=args.instructions,
         log_level=args.log_level,
         show_banner=args.show_banner,
+        connect_timeout=args.connect_timeout,
+        request_timeout=args.request_timeout,
+        sse_read_timeout=args.sse_read_timeout,
+        retries=args.retries,
+        retry_backoff=args.retry_backoff,
     )
     print(
         f"[bridge] start v{VERSION} name={opts.name} sse={opts.sse or os.getenv('MCP_REMOTE_SSE')}",
