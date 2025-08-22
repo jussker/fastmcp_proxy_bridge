@@ -47,7 +47,7 @@ import httpx
 from fastmcp import FastMCP
 from fastmcp import settings as fastmcp_settings
 from fastmcp.client.client import Client
-from fastmcp.client.transports import SSETransport
+from fastmcp.client.transports import SSETransport, StreamableHttpTransport
 from mcp.shared._httpx_utils import create_mcp_http_client
 
 VERSION = "0.2.0"
@@ -72,6 +72,9 @@ class Options:
     sse_read_timeout: Optional[float] = None  # SSETransport 内部 sse_read_timeout
     retries: int = 1
     retry_backoff: float = 2.0  # 指数退避基数（秒）
+    # transport & http2
+    transport: str = "sse"  # sse | streamable-http | auto
+    disable_http2: bool = False
 
 
 # ---------------- Header Helpers ----------------
@@ -165,14 +168,32 @@ def build_proxy(opts: Options) -> FastMCP:
             httpx_timeout = httpx.Timeout(
                 total, connect=connect, read=opts.request_timeout
             )
-            return create_mcp_http_client(
-                headers=headers, timeout=httpx_timeout, auth=auth
-            )
+            # 若需要禁用 HTTP/2，手动创建 AsyncClient；否则沿用 MCP 默认工厂
+            if opts.disable_http2:
+                return httpx.AsyncClient(
+                    headers=headers,
+                    timeout=httpx_timeout,
+                    auth=auth,
+                    follow_redirects=True,
+                    http2=False,
+                )
+            else:
+                return create_mcp_http_client(
+                    headers=headers, timeout=httpx_timeout, auth=auth
+                )
 
         httpx_client_factory = factory
 
-    def make_transport() -> SSETransport:
+    def make_transport_sse() -> SSETransport:
         return SSETransport(
+            url=sse_url,
+            headers=headers,
+            sse_read_timeout=opts.sse_read_timeout,
+            httpx_client_factory=httpx_client_factory,
+        )
+
+    def make_transport_streamable() -> StreamableHttpTransport:
+        return StreamableHttpTransport(
             url=sse_url,
             headers=headers,
             sse_read_timeout=opts.sse_read_timeout,
@@ -181,9 +202,15 @@ def build_proxy(opts: Options) -> FastMCP:
 
     attempt = 0
     last_err: Exception | None = None
+    chosen = opts.transport
     while attempt < max(1, opts.retries):
         attempt += 1
-        transport = make_transport()
+        if chosen == "sse":
+            transport = make_transport_sse()
+        elif chosen == "streamable-http":
+            transport = make_transport_streamable()
+        else:  # auto -> 首选 SSE
+            transport = make_transport_sse()
         client = Client(transport, timeout=opts.request_timeout)
         try:
             # 进行一次探测（同步环境下用 anyio.run）
@@ -203,7 +230,18 @@ def build_proxy(opts: Options) -> FastMCP:
                 print(
                     f"[bridge] probe failed (attempt {attempt}): {e}", file=sys.stderr
                 )
-                raise SystemExit(f"无法建立 SSE 连接: {e}")
+                # auto 模式下对 RemoteProtocolError 尝试回退到 streamable-http
+                if opts.transport == "auto" and isinstance(
+                    e, httpx.RemoteProtocolError
+                ):
+                    print(
+                        "[bridge] auto: falling back to streamable-http",
+                        file=sys.stderr,
+                    )
+                    chosen = "streamable-http"
+                    attempt = 0
+                    continue
+                raise SystemExit(f"无法建立连接: {e}")
             backoff = opts.retry_backoff * (2 ** (attempt - 1))
             print(
                 f"[bridge] probe failed (attempt {attempt}/{opts.retries}): {e}; retry in {backoff:.1f}s",
@@ -304,6 +342,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=2.0,
         help="重试指数退避基数秒 (实际间隔 = base * 2^(attempt-1))",
     )
+    p.add_argument(
+        "--transport",
+        choices=["sse", "streamable-http", "auto"],
+        default="sse",
+        dest="transport",
+        help="远端传输协议选择：SSE 或 Streamable HTTP；auto 模式在 SSE 失败时回退",
+    )
+    p.add_argument(
+        "--no-http2",
+        dest="disable_http2",
+        action="store_true",
+        help="禁用 HTTP/2（部分代理/服务在 HTTP/2 下不稳定）",
+    )
     p.add_argument("-h", "--help", action="help")
     return p
 
@@ -327,6 +378,8 @@ def main():  # pragma: no cover
         sse_read_timeout=args.sse_read_timeout,
         retries=args.retries,
         retry_backoff=args.retry_backoff,
+        transport=args.transport,
+        disable_http2=args.disable_http2,
     )
     print(
         f"[bridge] start v{VERSION} name={opts.name} sse={opts.sse or os.getenv('MCP_REMOTE_SSE')}",
