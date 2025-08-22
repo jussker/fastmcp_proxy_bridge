@@ -35,8 +35,10 @@ License: MIT
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -72,6 +74,15 @@ class Options:
     sse_read_timeout: Optional[float] = None  # SSETransport 内部 sse_read_timeout
     retries: int = 1
     retry_backoff: float = 2.0  # 指数退避基数（秒）
+    retry_min: Optional[float] = None  # 最小退避秒数（可将指数退避夹在 [min,max] 内）
+    retry_max: Optional[float] = None  # 最大退避秒数
+    retry_jitter: float = 0.0  # 抖动比例（0-1），例如 0.2 表示 ±20%
+    # request-level retries（运行期每个 MCP 调用）
+    request_retries: int = 0
+    request_retry_backoff: float = 1.0
+    request_retry_min: Optional[float] = None
+    request_retry_max: Optional[float] = None
+    request_retry_jitter: float = 0.0
     # transport & http2
     transport: str = "sse"  # sse | streamable-http | auto
     disable_http2: bool = False
@@ -242,7 +253,17 @@ def build_proxy(opts: Options) -> FastMCP:
                     attempt = 0
                     continue
                 raise SystemExit(f"无法建立连接: {e}")
+            # Annealing/exponential backoff with optional jitter and min/max clamp
             backoff = opts.retry_backoff * (2 ** (attempt - 1))
+            if opts.retry_jitter and opts.retry_jitter > 0:
+                # 在 [1-j, 1+j] 范围内随机抖动
+                j = max(0.0, min(1.0, opts.retry_jitter))
+                factor = random.uniform(1.0 - j, 1.0 + j)
+                backoff *= factor
+            if opts.retry_min is not None:
+                backoff = max(backoff, float(opts.retry_min))
+            if opts.retry_max is not None:
+                backoff = min(backoff, float(opts.retry_max))
             print(
                 f"[bridge] probe failed (attempt {attempt}/{opts.retries}): {e}; retry in {backoff:.1f}s",
                 file=sys.stderr,
@@ -259,13 +280,108 @@ def build_proxy(opts: Options) -> FastMCP:
             raise SystemExit(f"无法建立 SSE 连接: {last_err}")
 
     # 探测完成后重用最后构造的 client（探测时上下文已关闭，后续会重新建立 session）
+    # 包装 request 级别重试
+    proxy_client: Client | RetryingClient
+    if opts.request_retries and opts.request_retries > 0:
+        proxy_client = RetryingClient(client, opts)
+    else:
+        proxy_client = client
+
     proxy = FastMCP.as_proxy(
-        client,
+        proxy_client,  # type: ignore[arg-type]
         name=opts.name,
         instructions=opts.instructions,
         version=VERSION,
     )
     return proxy  # type: ignore[return-value]
+
+
+# ---------------- Request-level Retrier ----------------
+
+
+def _calc_backoff(
+    base: float,
+    attempt: int,
+    min_s: Optional[float],
+    max_s: Optional[float],
+    jitter: float,
+) -> float:
+    backoff = base * (2 ** (attempt - 1))
+    if jitter and jitter > 0:
+        j = max(0.0, min(1.0, jitter))
+        factor = random.uniform(1.0 - j, 1.0 + j)
+        backoff *= factor
+    if min_s is not None:
+        backoff = max(backoff, float(min_s))
+    if max_s is not None:
+        backoff = min(backoff, float(max_s))
+    return backoff
+
+
+_TRANSIENT_HTTPX_ERRORS: tuple[type[BaseException], ...] = (
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.PoolTimeout,
+    httpx.ConnectError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.RemoteProtocolError,
+)
+
+
+class RetryingClient:
+    """一个简单的 duck-typed Client 包装器，对所有异步方法做重试。
+
+    仅对被认为是瞬态网络错误的 httpx 异常进行重试；其它异常直接透传。
+    """
+
+    def __init__(self, inner: Client, opts: Options):
+        self._inner = inner
+        self._opts = opts
+
+    # ---- context manager ----
+    async def __aenter__(self):  # noqa: D401
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):  # noqa: D401
+        return await self._inner.__aexit__(exc_type, exc, tb)
+
+    # ---- attribute proxy with async call retry ----
+    def __getattr__(self, name: str):
+        attr = getattr(self._inner, name)
+        if inspect.iscoroutinefunction(attr) or (
+            inspect.ismethod(attr) and inspect.iscoroutinefunction(attr.__func__)  # type: ignore[attr-defined]
+        ):
+
+            async def wrapper(*args, **kwargs):
+                attempts = max(1, int(self._opts.request_retries))
+                last_err: Optional[BaseException] = None
+                for i in range(1, attempts + 1):
+                    try:
+                        return await attr(*args, **kwargs)
+                    except _TRANSIENT_HTTPX_ERRORS as e:  # noqa: PERF203
+                        last_err = e
+                        if i >= attempts:
+                            raise
+                        backoff = _calc_backoff(
+                            self._opts.request_retry_backoff,
+                            i,
+                            self._opts.request_retry_min,
+                            self._opts.request_retry_max,
+                            self._opts.request_retry_jitter,
+                        )
+                        print(
+                            f"[bridge] request retry {i}/{attempts} in {backoff:.1f}s due to: {e}",
+                            file=sys.stderr,
+                        )
+                        await anyio.sleep(backoff)
+                        continue
+                if last_err:
+                    raise last_err
+
+            return wrapper
+        return attr
 
 
 # ---------------- CLI ----------------
@@ -343,6 +459,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="重试指数退避基数秒 (实际间隔 = base * 2^(attempt-1))",
     )
     p.add_argument(
+        "--retry-min",
+        type=float,
+        dest="retry_min",
+        help="退避下限（秒）；与指数退避组合，最终等待会被夹在 [min, max] 范围内",
+    )
+    p.add_argument(
+        "--retry-max",
+        type=float,
+        dest="retry_max",
+        help="退避上限（秒）；典型如 30 与 --retry-min 5 组合形成 5-30s 退火窗口",
+    )
+    p.add_argument(
+        "--retry-jitter",
+        type=float,
+        dest="retry_jitter",
+        default=0.0,
+        help="退避抖动比例（0-1），例如 0.2 表示在 ±20% 范围内随机波动",
+    )
+    # request-level retry controls
+    p.add_argument(
+        "--request-retries",
+        type=int,
+        dest="request_retries",
+        default=0,
+        help="运行期每个 MCP 请求的重试次数（含首次）。默认 0 不重试",
+    )
+    p.add_argument(
+        "--request-retry-backoff",
+        type=float,
+        dest="request_retry_backoff",
+        default=1.0,
+        help="请求级指数退避基数秒",
+    )
+    p.add_argument(
+        "--request-retry-min",
+        type=float,
+        dest="request_retry_min",
+        help="请求级退避下限（秒）",
+    )
+    p.add_argument(
+        "--request-retry-max",
+        type=float,
+        dest="request_retry_max",
+        help="请求级退避上限（秒）",
+    )
+    p.add_argument(
+        "--request-retry-jitter",
+        type=float,
+        dest="request_retry_jitter",
+        default=0.0,
+        help="请求级退避抖动比例（0-1）",
+    )
+    p.add_argument(
         "--transport",
         choices=["sse", "streamable-http", "auto"],
         default="sse",
@@ -378,6 +547,14 @@ def main():  # pragma: no cover
         sse_read_timeout=args.sse_read_timeout,
         retries=args.retries,
         retry_backoff=args.retry_backoff,
+        retry_min=args.retry_min,
+        retry_max=args.retry_max,
+        retry_jitter=args.retry_jitter,
+        request_retries=args.request_retries,
+        request_retry_backoff=args.request_retry_backoff,
+        request_retry_min=args.request_retry_min,
+        request_retry_max=args.request_retry_max,
+        request_retry_jitter=args.request_retry_jitter,
         transport=args.transport,
         disable_http2=args.disable_http2,
     )
